@@ -22,6 +22,27 @@ import sys
 import pandas as pd
 import plotly.express as px
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# 共用連線：遇到斷線、逾時、5xx 自動重試（間隔 5、10、20、40 秒）
+# 證交所對 GitHub 機房的 IP 偶爾會直接切斷連線，重試通常就能成功
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+SESSION.mount(
+    "https://",
+    HTTPAdapter(
+        max_retries=Retry(
+            total=4,
+            backoff_factor=5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+    ),
+)
+
+# 自動模式下「資料還不是今天」時的結束代碼，workflow 會辨識它
+EXIT_STALE = 75
 
 # --------------------------------------------------------------------------
 # 族群對照表：族群名稱 -> 股票名稱清單
@@ -96,7 +117,7 @@ def _norm(s: pd.Series) -> pd.Series:
 
 
 def fetch(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r = SESSION.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return pd.DataFrame(r.json())
 
@@ -123,7 +144,11 @@ def _fetch_twse_latest() -> tuple[pd.DataFrame, str]:
         print(f"  （openapi 來源失敗：{exc}）")
 
     try:
-        c = pd.read_csv(QUOTE_URL_CSV, dtype=str)
+        import io
+
+        r = SESSION.get(QUOTE_URL_CSV, timeout=30)
+        r.raise_for_status()
+        c = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig")), dtype=str)
         c = c.rename(
             columns={
                 "證券代號": "Code",
@@ -200,7 +225,7 @@ def load_quotes() -> tuple[pd.DataFrame, str]:
                 "name": tpex[col("CompanyName", "Name", "名稱")].astype(str).str.strip(),
                 "close": _to_num(tpex[col("Close", "收盤")]),
                 "change": _to_num(tpex[col("Change", "漲跌")]),
-                "value": _to_num(tpex[col("TradingAmount", "TradeValue", "成交金額")]),
+                "value": _to_num(tpex[col("TradingAmount", "TransactionAmount", "TradeValue", "成交金額")]),
                 "market": "上櫃",
             }
         )
@@ -280,7 +305,7 @@ def load_tpex_by_date(date_str: str) -> pd.DataFrame:
             else {"l": "zh-tw", "d": roc, "o": "json"}
         )
         try:
-            r = requests.get(
+            r = SESSION.get(
                 url, params=params, timeout=30,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
@@ -324,7 +349,7 @@ def load_quotes_by_date(date_str: str) -> tuple[pd.DataFrame, str]:
     注意這支的漲跌方向放在獨立的「漲跌(+/-)」欄位，且內容是 HTML，
     必須另外解析符號，不能直接把「漲跌價差」當成有號數字。
     """
-    r = requests.get(
+    r = SESSION.get(
         MI_INDEX_URL,
         params={"response": "json", "date": date_str, "type": "ALLBUT0999"},
         timeout=30,
@@ -496,7 +521,7 @@ def fetch_institutional(date_str: str | None = None) -> dict:
     errors = []
     for url in urls:
         try:
-            r = requests.get(
+            r = SESSION.get(
                 url, params=params, timeout=30,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
@@ -813,6 +838,14 @@ def main() -> int:
             print(f"抓取資料失敗：{exc}")
             return 1
     else:
+        import datetime
+        import os
+
+        stamp_today = datetime.date.today().strftime("%Y%m%d")
+        done = f"docs/archive/twstock_group_heatmap_{stamp_today}.html"
+        if os.path.exists(done):
+            print(f"今天的檔案已存在（{done}），不用重跑")
+            return 0
         print("下載台股資料中…")
         try:
             quotes, data_date = load_quotes()
@@ -828,10 +861,11 @@ def main() -> int:
     print(f"\n★ 資料日期：{data_date}")
     if not csv_path and not date_str and data_date != today:
         print(
-            f"  注意：這不是今天（{today}）的資料。\n"
-            "  證交所這支 API 是盤後資料，收盤後才會更新；\n"
-            "  盤中執行會拿到前一個交易日。若今天是假日則屬正常。"
+            f"  注意：這不是今天（{today}）的資料，本次不輸出檔案。\n"
+            "  可能是證交所盤後資料還沒更新，或今天休市。\n"
+            "  稍晚的排程會再試一次；也可以手動指定日期補跑。"
         )
+        return EXIT_STALE
 
     df = build_dataframe(quotes, capital)
     no_cap = int((df["market_cap"] == 0).sum())
