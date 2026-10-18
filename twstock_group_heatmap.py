@@ -473,6 +473,79 @@ def fetch_index_info(data_date: str) -> dict:
         return {}
 
 
+# 櫃買指數：櫃買中心換過網址，新舊各試一次（月資料，逐日一列）
+TPEX_INDEX_ENDPOINTS = [
+    ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingIndex", "new"),
+    (
+        "https://www.tpex.org.tw/web/stock/aftertrading/"
+        "daily_trading_index/st41_result.php",
+        "old",
+    ),
+]
+
+
+def fetch_otc_index(data_date: str) -> dict:
+    """櫃買指數收盤與漲跌點數。抓不到就回空 dict，並在 log 印出原因。"""
+    if "/" not in data_date:
+        return {}
+    y, m, d = data_date.split("/")
+    roc_day = f"{int(y) - 1911}/{m}/{d}"
+    errors = []
+
+    for url, style in TPEX_INDEX_ENDPOINTS:
+        params = (
+            {"date": f"{y}/{m}/{d}", "response": "json"}
+            if style == "new"
+            else {"l": "zh-tw", "d": f"{int(y) - 1911}/{m}", "o": "json"}
+        )
+        try:
+            r = SESSION.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+
+            # 相容 tables / aaData / data 幾種格式
+            fields, rows = [], []
+            if isinstance(j.get("tables"), list) and j["tables"]:
+                t = j["tables"][0]
+                fields, rows = t.get("fields") or [], t.get("data") or []
+            else:
+                fields = j.get("fields") or []
+                rows = j.get("aaData") or j.get("data") or []
+            if not rows:
+                raise RuntimeError("回應中沒有資料列")
+
+            def find(*keys: str, default: int) -> int:
+                for i, f in enumerate(fields):
+                    if any(k in str(f) for k in keys):
+                        return i
+                return default
+
+            # 舊版沒附欄位名稱時，欄位順序為：日期、成交股數、金額、筆數、櫃買指數、漲跌
+            i_idx = find("指數", default=4)
+            i_chg = find("漲跌", default=5)
+
+            row = next(
+                (rw for rw in rows if str(rw[0]).strip().replace(" ", "") == roc_day),
+                None,
+            )
+            if row is None:
+                raise RuntimeError(f"月資料中找不到 {roc_day}（可能尚未更新）")
+
+            idx = _to_num(pd.Series([row[i_idx]])).iloc[0]
+            chg = _to_num(pd.Series([row[i_chg]])).iloc[0]
+            if pd.isna(idx) or pd.isna(chg):
+                raise RuntimeError(f"數值解析失敗：{row}")
+            print(f"  櫃買指數來源：{style}（{float(idx):,.2f}，{float(chg):+,.2f}）")
+            return {"otc_index": float(idx), "otc_change": float(chg)}
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{style} -> {exc}")
+
+    print("  （櫃買指數抓取失敗，總覽將略過該項）")
+    for e in errors:
+        print(f"    - {e}")
+    return {}
+
+
 def _accumulate_inst(out: dict, name: str, buy: float, sell: float, net: float) -> None:
     """把單位名稱歸到外資／投信／自營商三類，買進、賣出、買賣超一起累加。"""
     name = name.strip()
@@ -608,6 +681,11 @@ def make_summary(
         head = f"加權指數收 {idx:,.2f} 點，{tone} {abs(chg):,.2f} 點"
         if amt:
             head += f"，成交金額約 {amt / 1e8:,.0f} 億元"
+        if index_info.get("otc_index") is not None:
+            oc = index_info["otc_change"]
+            otone = "上漲" if oc > 0 else "下跌" if oc < 0 else "平盤"
+            head += f"；櫃買指數收 {index_info['otc_index']:,.2f} 點"
+            head += f"，{otone} {abs(oc):,.2f} 點" if oc else "，與前日持平"
         lines.append(head + "。")
 
     # --- 漲跌家數（用全市場，不只族群成分股）---
@@ -876,6 +954,8 @@ def main() -> int:
 
     # --- 盤勢總覽 ---
     index_info = fetch_index_info(data_date) if not csv_path else {}
+    if index_info and not csv_path:
+        index_info.update(fetch_otc_index(data_date))
     inst_info = fetch_institutional(date_str) if not csv_path else {}
     summary = make_summary(df, quotes, data_date, index_info, inst_info)
 
