@@ -454,23 +454,91 @@ def build_dataframe(quotes: pd.DataFrame, capital: pd.DataFrame) -> pd.DataFrame
     return out.drop_duplicates(subset=["group", "code"]).reset_index(drop=True)
 
 
+FMTQIK_WWW_URLS = [
+    "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK",
+    "https://www.twse.com.tw/exchangeReport/FMTQIK",
+]
+
+
 def fetch_index_info(data_date: str) -> dict:
-    """大盤加權指數、漲跌點數、成交金額。抓不到就回空 dict，不影響其他內容。"""
-    try:
-        d = fetch(FMTQIK_URL)
-        want = data_date.replace("/", "")
-        want_roc = f"{int(want[:4]) - 1911}{want[4:]}"
-        row = d[d["Date"].astype(str).str.strip() == want_roc]
-        if row.empty:
-            return {}
-        r = row.iloc[0]
-        return {
-            "index": _to_num(pd.Series([r["TAIEX"]])).iloc[0],
-            "change": _to_num(pd.Series([r["Change"]])).iloc[0],
-            "amount": _to_num(pd.Series([r["TradeValue"]])).iloc[0],
-        }
-    except Exception:  # noqa: BLE001
+    """大盤加權指數、漲跌點數、成交金額。抓不到就回空 dict，並在 log 印出原因。
+
+    openapi 那支更新得比較晚（傍晚才有當天），所以先試 www 的月報表，
+    它收盤後很快就會更新；兩邊都試，誰有當天資料就用誰。
+    """
+    if "/" not in data_date:
         return {}
+    y, m, d = data_date.split("/")
+    roc_slash = f"{int(y) - 1911}/{m}/{d}"   # www 版日期格式：115/10/19
+    roc_plain = f"{int(y) - 1911}{m}{d}"     # openapi 版日期格式：1151019
+    errors = []
+
+    def num(v):
+        return _to_num(pd.Series([v])).iloc[0]
+
+    # --- www 月報表 ---
+    for url in FMTQIK_WWW_URLS:
+        try:
+            r = SESSION.get(
+                url, params={"response": "json", "date": f"{y}{m}{d}"}, timeout=30
+            )
+            r.raise_for_status()
+            j = r.json()
+            if j.get("stat") != "OK":
+                raise RuntimeError(f"stat={j.get('stat')}")
+            fields = j.get("fields") or []
+            rows = j.get("data") or []
+            if not rows and isinstance(j.get("tables"), list) and j["tables"]:
+                fields = j["tables"][0].get("fields") or []
+                rows = j["tables"][0].get("data") or []
+
+            def find(key: str, default: int) -> int:
+                for i, f in enumerate(fields):
+                    if key in str(f):
+                        return i
+                return default
+
+            # 欄位順序：日期、成交股數、成交金額、成交筆數、發行量加權股價指數、漲跌點數
+            i_amt, i_idx, i_chg = find("成交金額", 2), find("指數", 4), find("漲跌", 5)
+            row = next(
+                (rw for rw in rows if str(rw[0]).strip().replace(" ", "") == roc_slash),
+                None,
+            )
+            if row is None:
+                raise RuntimeError(f"月報表中還沒有 {roc_slash}")
+            info = {
+                "index": num(row[i_idx]),
+                "change": num(row[i_chg]),
+                "amount": num(row[i_amt]),
+            }
+            if pd.isna(info["index"]) or pd.isna(info["change"]):
+                raise RuntimeError(f"數值解析失敗：{row}")
+            print(f"  加權指數來源：www（{info['index']:,.2f}，{info['change']:+,.2f}）")
+            return info
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url} -> {exc}")
+
+    # --- openapi ---
+    try:
+        dd = fetch(FMTQIK_URL)
+        row = dd[dd["Date"].astype(str).str.strip() == roc_plain]
+        if row.empty:
+            raise RuntimeError(f"還沒有 {roc_plain}（最新一筆：{dd['Date'].iloc[-1]}）")
+        r0 = row.iloc[0]
+        info = {
+            "index": num(r0["TAIEX"]),
+            "change": num(r0["Change"]),
+            "amount": num(r0["TradeValue"]),
+        }
+        print(f"  加權指數來源：openapi（{info['index']:,.2f}，{info['change']:+,.2f}）")
+        return info
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"openapi -> {exc}")
+
+    print("  （加權指數抓取失敗，總覽將略過該項）")
+    for e in errors:
+        print(f"    - {e}")
+    return {}
 
 
 # 櫃買指數：櫃買中心換過網址，新舊各試一次（月資料，逐日一列）
@@ -673,20 +741,24 @@ def make_summary(
     """用手上的資料生出一段盤勢總覽文字。"""
     lines = []
 
-    # --- 大盤 ---
-    if index_info:
-        idx, chg = index_info.get("index"), index_info.get("change")
+    # --- 大盤（加權、櫃買各自獨立，有哪個就寫哪個）---
+    parts_head = []
+    if index_info.get("index") is not None:
+        idx, chg = index_info["index"], index_info["change"]
         amt = index_info.get("amount")
         tone = "大漲" if chg > 300 else "上漲" if chg > 0 else "下跌" if chg > -300 else "重挫"
-        head = f"加權指數收 {idx:,.2f} 點，{tone} {abs(chg):,.2f} 點"
+        h = f"加權指數收 {idx:,.2f} 點，{tone} {abs(chg):,.2f} 點"
         if amt:
-            head += f"，成交金額約 {amt / 1e8:,.0f} 億元"
-        if index_info.get("otc_index") is not None:
-            oc = index_info["otc_change"]
-            otone = "上漲" if oc > 0 else "下跌" if oc < 0 else "平盤"
-            head += f"；櫃買指數收 {index_info['otc_index']:,.2f} 點"
-            head += f"，{otone} {abs(oc):,.2f} 點" if oc else "，與前日持平"
-        lines.append(head + "。")
+            h += f"，成交金額約 {amt / 1e8:,.0f} 億元"
+        parts_head.append(h)
+    if index_info.get("otc_index") is not None:
+        oc = index_info["otc_change"]
+        otone = "上漲" if oc > 0 else "下跌" if oc < 0 else "平盤"
+        h = f"櫃買指數收 {index_info['otc_index']:,.2f} 點"
+        h += f"，{otone} {abs(oc):,.2f} 點" if oc else "，與前日持平"
+        parts_head.append(h)
+    if parts_head:
+        lines.append("；".join(parts_head) + "。")
 
     # --- 漲跌家數（用全市場，不只族群成分股）---
     q = all_quotes.dropna(subset=["close", "change"])
@@ -757,7 +829,7 @@ def make_summary(
     )
 
     # --- 背離提醒：整個族群逆勢 ---
-    if index_info and index_info.get("change") is not None:
+    if index_info.get("change") is not None:
         mkt_up = index_info["change"] > 0
         for name, val in g.items():
             sub = df[df["group"] == name]
@@ -954,8 +1026,9 @@ def main() -> int:
 
     # --- 盤勢總覽 ---
     index_info = fetch_index_info(data_date) if not csv_path else {}
-    if index_info and not csv_path:
-        index_info.update(fetch_otc_index(data_date))
+    # 櫃買指數獨立抓，加權指數失敗也不影響
+    otc_info = fetch_otc_index(data_date) if not csv_path else {}
+    index_info = {**index_info, **otc_info}
     inst_info = fetch_institutional(date_str) if not csv_path else {}
     summary = make_summary(df, quotes, data_date, index_info, inst_info)
 
