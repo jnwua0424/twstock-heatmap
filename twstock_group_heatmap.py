@@ -778,8 +778,55 @@ def update_group_history(df: pd.DataFrame, data_date: str) -> pd.DataFrame:
     return hist
 
 
+def _group_state(pv: pd.DataFrame, codes: list[str]) -> dict:
+    """用某段期間的漲跌幅樞紐表，算一個族群的趨勢／格局／乖離／站上月線檔數。"""
+    daily = pv[codes].mean(axis=1, skipna=True).dropna()
+    if len(daily) < GROUP_TREND_MIN_DAYS:
+        return {}
+    idx = (1 + daily / 100).cumprod() * 100
+    info = classify_trend(idx)
+    if not info:
+        return {}
+
+    # 成分股站上月線比例：每檔各自用漲跌幅連乘還原走勢，看收盤是否在自己的 20MA 之上。
+    # 只計入「有今天資料、且至少 20 天紀錄」的個股；一檔漲停也只算一檔，不受飆股影響。
+    last_date = pv.index[-1]
+    above = valid = 0
+    for c in codes:
+        s = pv[c].dropna()
+        if len(s) < GROUP_TREND_MIN_DAYS or s.index[-1] != last_date:
+            continue
+        px_ = (1 + s / 100).cumprod()
+        valid += 1
+        if px_.iloc[-1] > px_.tail(GROUP_TREND_MIN_DAYS).mean():
+            above += 1
+
+    key = (info["trend"], info["structure"])
+    return {
+        "trend": info["trend"],
+        "structure": info["structure"],
+        "bias": (idx.iloc[-1] / info["ma20"] - 1) * 100,
+        "comment": GROUP_TREND_SHORT[key],
+        "tier": GROUP_TREND_TIER[key],
+        "above": above,
+        "valid": valid,
+    }
+
+
+def _describe_change(prev: dict, cur: dict) -> str:
+    """和前一個交易日比，描述狀態轉變；沒變化回傳空字串。"""
+    if not prev:
+        return ""
+    parts = []
+    if prev["trend"] != cur["trend"]:
+        parts.append(f"{prev['trend']}→{cur['trend']}")
+    if prev["structure"] != cur["structure"]:
+        parts.append("站上月線" if cur["structure"] == "多方格局" else "跌破月線")
+    return "、".join(parts)
+
+
 def compute_group_trends(df: pd.DataFrame, hist: pd.DataFrame, date8: str) -> list[dict]:
-    """算出每個族群的趨勢／格局／乖離，依強弱排序。
+    """算出每個族群的趨勢／格局／乖離／站上月線比例，並和前一交易日比對狀態變化。
 
     族群成分以「今天的 GROUPS」為準，所以調整分類後歷史也會跟著重算。
     """
@@ -787,48 +834,62 @@ def compute_group_trends(df: pd.DataFrame, hist: pd.DataFrame, date8: str) -> li
     if h.empty:
         return []
     pv = h.pivot_table(index="date", columns="code", values="pct", aggfunc="last").sort_index()
+    pv_prev = pv.iloc[:-1]  # 前一個交易日為止
 
     rows = []
     for g, sub in df.groupby("group"):
         codes = [c for c in sub["code"].unique() if c in pv.columns]
         if not codes:
             continue
-        daily = pv[codes].mean(axis=1, skipna=True).dropna()
-        if len(daily) < GROUP_TREND_MIN_DAYS:
+        cur = _group_state(pv, codes)
+        if not cur:
             continue
-        idx = (1 + daily / 100).cumprod() * 100
-        info = classify_trend(idx)
-        if not info:
-            continue
-        key = (info["trend"], info["structure"])
-        rows.append(
-            {
-                "group": g,
-                "trend": info["trend"],
-                "structure": info["structure"],
-                "bias": (idx.iloc[-1] / info["ma20"] - 1) * 100,
-                "comment": GROUP_TREND_SHORT[key],
-                "tier": GROUP_TREND_TIER[key],
-            }
+        prev = _group_state(pv_prev, codes) if len(pv_prev) else {}
+        cur["group"] = g
+        cur["change"] = _describe_change(prev, cur)
+        # 轉變方向：分級數字變小＝轉強，變大＝轉弱
+        cur["change_dir"] = (
+            0 if not prev or not cur["change"]
+            else -1 if cur["tier"] < prev["tier"]
+            else 1 if cur["tier"] > prev["tier"]
+            else 0
         )
+        cur["prev_above"] = prev.get("above") if prev else None
+        rows.append(cur)
     rows.sort(key=lambda r: (r["tier"], -r["bias"]))
     return rows
 
 
 def group_trend_html(rows: list[dict]) -> str:
-    """族群趨勢表格，樣式與盤勢總覽一致。乖離紅正綠負（台股慣例）。"""
+    """族群趨勢表格，樣式與盤勢總覽一致。紅色代表轉強／正值，綠色代表轉弱／負值（台股慣例）。"""
     import html as html_mod
 
+    red, green, plain = "#ff5a50", "#2ecc71", "#e8e8e8"
     th = "padding:6px 12px;text-align:left;color:#aaa;font-weight:normal;border-bottom:1px solid #333"
     td = "padding:5px 12px;border-bottom:1px solid #262626;white-space:nowrap"
     body = ""
     for r in rows:
-        color = "#ff5a50" if r["bias"] > 0 else "#2ecc71" if r["bias"] < 0 else "#e8e8e8"
+        bias_color = red if r["bias"] > 0 else green if r["bias"] < 0 else plain
+
+        # 站上月線比例，和昨天相比多了或少了就加箭頭
+        ratio = f"{r['above']}/{r['valid']}" if r["valid"] else "—"
+        arrow = ""
+        if r["valid"] and r["prev_above"] is not None and r["above"] != r["prev_above"]:
+            arrow = (
+                f" <span style='color:{red}'>▲</span>" if r["above"] > r["prev_above"]
+                else f" <span style='color:{green}'>▼</span>"
+            )
+
+        chg_color = red if r["change_dir"] < 0 else green if r["change_dir"] > 0 else plain
+        change = html_mod.escape(r["change"]) if r["change"] else "<span style='color:#555'>—</span>"
+
         body += (
             f"<tr><td style='{td}'>{html_mod.escape(r['group'])}</td>"
             f"<td style='{td}'>{r['trend']}</td>"
             f"<td style='{td}'>{r['structure']}</td>"
-            f"<td style='{td};color:{color};text-align:right'>{r['bias']:+.1f}%</td>"
+            f"<td style='{td};color:{bias_color};text-align:right'>{r['bias']:+.1f}%</td>"
+            f"<td style='{td};text-align:right'>{ratio}{arrow}</td>"
+            f"<td style='{td};color:{chg_color}'>{change}</td>"
             f"<td style='{td}'>{r['comment']}</td></tr>"
         )
     return (
@@ -837,10 +898,14 @@ def group_trend_html(rows: list[dict]) -> str:
         "font-size:14px;border-bottom:1px solid #333\">"
         "<h2 style='margin:0 0 4px 0;font-size:19px;color:#fff'>族群日K 趨勢／格局</h2>"
         "<div style='color:#888;font-size:13px;margin-bottom:12px'>"
-        "依強弱分級排序，同級內依離月線乖離由高到低</div>"
+        "依強弱分級排序，同級內依離月線乖離由高到低｜"
+        "站上月線＝成分股收盤在自身 20MA 之上的檔數｜"
+        "狀態變化為與前一交易日相比</div>"
         "<div style='overflow-x:auto'><table style='border-collapse:collapse'>"
         f"<tr><th style='{th}'>族群</th><th style='{th}'>趨勢</th><th style='{th}'>格局</th>"
-        f"<th style='{th};text-align:right'>乖離</th><th style='{th}'>解讀</th></tr>"
+        f"<th style='{th};text-align:right'>乖離</th>"
+        f"<th style='{th};text-align:right'>站上月線</th>"
+        f"<th style='{th}'>狀態變化</th><th style='{th}'>解讀</th></tr>"
         f"{body}</table></div></div>"
     )
 
@@ -1383,9 +1448,11 @@ def main() -> int:
                 print("族群日K 趨勢／格局")
                 print("=" * 60)
                 for r in group_trends:
+                    chg = f"｜變化：{r['change']}" if r["change"] else ""
                     print(
                         f"  {r['group']}：{r['trend']}｜{r['structure']}"
-                        f"｜乖離 {r['bias']:+.1f}%｜{r['comment']}"
+                        f"｜乖離 {r['bias']:+.1f}%｜站上月線 {r['above']}/{r['valid']}"
+                        f"{chg}｜{r['comment']}"
                     )
             else:
                 print("  （族群趨勢：歷史資料不足 20 日，本次略過）")
