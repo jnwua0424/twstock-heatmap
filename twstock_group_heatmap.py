@@ -666,6 +666,185 @@ def fetch_taiex_trend(data_date: str, today_close: float | None = None) -> dict:
     return info
 
 
+# --------------------------------------------------------------------------
+# 族群日K 趨勢／格局
+#   族群指數：成分股每日漲跌幅等權平均，逐日連乘（起始 100），
+#             用漲跌幅連乘，除權息缺口不會被誤判成大跌。
+#   歷史資料：每天把成分股漲跌幅存進 GROUP_HISTORY_PATH；
+#             不足 20 個交易日時，自動用 load_quotes_by_date 往回補抓。
+#   ※ 新增族群或個股後，若想讓它立刻有趨勢判斷，刪掉歷史檔重跑即可重建。
+# --------------------------------------------------------------------------
+GROUP_HISTORY_PATH = "docs/group_history.csv"
+GROUP_HISTORY_KEEP = 60        # 歷史檔保留的交易日數
+GROUP_TREND_MIN_DAYS = 20      # 算 20MA 至少需要的天數
+GROUP_TREND_BACKFILL_TO = 25   # 補抓時的目標天數（多抓幾天當緩衝）
+
+# 強弱分級：數字越小越強
+GROUP_TREND_TIER = {
+    ("多頭排列", "多方格局"): 0,
+    ("空頭排列", "多方格局"): 1,
+    ("糾結", "多方格局"): 2,
+    ("多頭排列", "空方格局"): 3,
+    ("糾結", "空方格局"): 4,
+    ("空頭排列", "空方格局"): 5,
+}
+GROUP_TREND_SHORT = {
+    ("多頭排列", "多方格局"): "標準多方",
+    ("空頭排列", "多方格局"): "急彈，反彈性質",
+    ("糾結", "多方格局"): "整理偏多",
+    ("多頭排列", "空方格局"): "急跌破線，轉弱警訊",
+    ("糾結", "空方格局"): "整理偏空",
+    ("空頭排列", "空方格局"): "標準空方",
+}
+_HIST_COLS = ["date", "code", "name", "pct"]
+
+
+def _group_snapshot(df: pd.DataFrame, date8: str) -> pd.DataFrame:
+    """把當天族群成分股的漲跌幅整理成歷史檔的格式（每檔一列）。"""
+    s = df.drop_duplicates(subset=["code"])[["code", "name", "pct"]].copy()
+    s.insert(0, "date", date8)
+    return s
+
+
+def _load_group_history() -> pd.DataFrame:
+    import os
+
+    if not os.path.exists(GROUP_HISTORY_PATH):
+        return pd.DataFrame(columns=_HIST_COLS)
+    try:
+        h = pd.read_csv(GROUP_HISTORY_PATH, dtype={"date": str, "code": str})
+        return h[_HIST_COLS]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  （族群歷史檔讀取失敗，將重建：{exc}）")
+        return pd.DataFrame(columns=_HIST_COLS)
+
+
+def _backfill_group_history(have: set, date8: str) -> list[pd.DataFrame]:
+    """往回補抓歷史行情，直到湊滿 GROUP_TREND_BACKFILL_TO 個交易日。"""
+    import contextlib
+    import datetime
+    import io
+
+    frames = []
+    day = datetime.datetime.strptime(date8, "%Y%m%d").date()
+    print(f"  族群歷史只有 {len(have)} 天，開始往回補抓（只有第一次會比較久）…")
+    for _ in range(45):  # 最多往回找 45 個日曆天
+        if len(have) >= GROUP_TREND_BACKFILL_TO:
+            break
+        day -= datetime.timedelta(days=1)
+        if day.weekday() >= 5:
+            continue
+        d8 = day.strftime("%Y%m%d")
+        if d8 in have:
+            continue
+        try:
+            # 補抓時不要印出每天的「找不到名稱」等訊息，log 才不會被洗版
+            with contextlib.redirect_stdout(io.StringIO()):
+                q, _ = load_quotes_by_date(d8)
+                snap = _group_snapshot(
+                    build_dataframe(q, pd.DataFrame({"code": [], "capital": []})), d8
+                )
+            frames.append(snap)
+            have.add(d8)
+            print(f"    {d8} 補抓完成（{len(snap)} 檔）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    {d8} 略過：{exc}")  # 多半是休市日
+        time.sleep(2)  # 證交所對連續請求很敏感
+    return frames
+
+
+def update_group_history(df: pd.DataFrame, data_date: str) -> pd.DataFrame:
+    """把當天資料寫進歷史檔；天數不足就先補抓。回傳更新後的歷史。"""
+    import os
+
+    date8 = data_date.replace("/", "")
+    hist = _load_group_history()
+    hist = hist[hist["date"] != date8]
+    hist = pd.concat([hist, _group_snapshot(df, date8)], ignore_index=True)
+
+    have = set(hist.loc[hist["date"] <= date8, "date"])
+    if len(have) < GROUP_TREND_MIN_DAYS:
+        frames = _backfill_group_history(have, date8)
+        if frames:
+            hist = pd.concat([hist, *frames], ignore_index=True)
+
+    hist = hist.drop_duplicates(subset=["date", "code"], keep="last")
+    keep = sorted(hist["date"].unique())[-GROUP_HISTORY_KEEP:]
+    hist = hist[hist["date"].isin(keep)].sort_values(["date", "code"])
+
+    os.makedirs(os.path.dirname(GROUP_HISTORY_PATH), exist_ok=True)
+    hist.to_csv(GROUP_HISTORY_PATH, index=False, encoding="utf-8")
+    print(f"  族群歷史已更新：{hist['date'].nunique()} 個交易日")
+    return hist
+
+
+def compute_group_trends(df: pd.DataFrame, hist: pd.DataFrame, date8: str) -> list[dict]:
+    """算出每個族群的趨勢／格局／乖離，依強弱排序。
+
+    族群成分以「今天的 GROUPS」為準，所以調整分類後歷史也會跟著重算。
+    """
+    h = hist[hist["date"] <= date8]
+    if h.empty:
+        return []
+    pv = h.pivot_table(index="date", columns="code", values="pct", aggfunc="last").sort_index()
+
+    rows = []
+    for g, sub in df.groupby("group"):
+        codes = [c for c in sub["code"].unique() if c in pv.columns]
+        if not codes:
+            continue
+        daily = pv[codes].mean(axis=1, skipna=True).dropna()
+        if len(daily) < GROUP_TREND_MIN_DAYS:
+            continue
+        idx = (1 + daily / 100).cumprod() * 100
+        info = classify_trend(idx)
+        if not info:
+            continue
+        key = (info["trend"], info["structure"])
+        rows.append(
+            {
+                "group": g,
+                "trend": info["trend"],
+                "structure": info["structure"],
+                "bias": (idx.iloc[-1] / info["ma20"] - 1) * 100,
+                "comment": GROUP_TREND_SHORT[key],
+                "tier": GROUP_TREND_TIER[key],
+            }
+        )
+    rows.sort(key=lambda r: (r["tier"], -r["bias"]))
+    return rows
+
+
+def group_trend_html(rows: list[dict]) -> str:
+    """族群趨勢表格，樣式與盤勢總覽一致。乖離紅正綠負（台股慣例）。"""
+    import html as html_mod
+
+    th = "padding:6px 12px;text-align:left;color:#aaa;font-weight:normal;border-bottom:1px solid #333"
+    td = "padding:5px 12px;border-bottom:1px solid #262626;white-space:nowrap"
+    body = ""
+    for r in rows:
+        color = "#ff5a50" if r["bias"] > 0 else "#2ecc71" if r["bias"] < 0 else "#e8e8e8"
+        body += (
+            f"<tr><td style='{td}'>{html_mod.escape(r['group'])}</td>"
+            f"<td style='{td}'>{r['trend']}</td>"
+            f"<td style='{td}'>{r['structure']}</td>"
+            f"<td style='{td};color:{color};text-align:right'>{r['bias']:+.1f}%</td>"
+            f"<td style='{td}'>{r['comment']}</td></tr>"
+        )
+    return (
+        "<div style=\"background:#1a1a1a;color:#e8e8e8;"
+        "font-family:'Microsoft JhengHei',sans-serif;padding:20px 28px;"
+        "font-size:14px;border-bottom:1px solid #333\">"
+        "<h2 style='margin:0 0 4px 0;font-size:19px;color:#fff'>族群日K 趨勢／格局</h2>"
+        "<div style='color:#888;font-size:13px;margin-bottom:12px'>"
+        "依強弱分級排序，同級內依離月線乖離由高到低</div>"
+        "<div style='overflow-x:auto'><table style='border-collapse:collapse'>"
+        f"<tr><th style='{th}'>族群</th><th style='{th}'>趨勢</th><th style='{th}'>格局</th>"
+        f"<th style='{th};text-align:right'>乖離</th><th style='{th}'>解讀</th></tr>"
+        f"{body}</table></div></div>"
+    )
+
+
 # 櫃買指數：櫃買中心換過網址，新舊各試一次（月資料，逐日一列）
 TPEX_INDEX_ENDPOINTS = [
     ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingIndex", "new"),
@@ -1070,7 +1249,12 @@ def parse_args() -> tuple[str | None, str | None]:
 
 
 def write_html_with_summary(
-    fig, path: str, data_date: str, summary: list[str], chips_data: dict | None = None
+    fig,
+    path: str,
+    data_date: str,
+    summary: list[str],
+    chips_data: dict | None = None,
+    group_trends: list[dict] | None = None,
 ) -> None:
     """把總覽文字插在圖表上方，存成單一 HTML。"""
     import html as html_mod
@@ -1087,6 +1271,9 @@ def write_html_with_summary(
         f"今日盤勢總覽　<span style='font-size:14px;color:#888'>{data_date}</span></h2>"
         f"{body}</div>"
     )
+
+    if group_trends:
+        block += group_trend_html(group_trends)
 
     if chips_data and chips_mod:
         block += chips_mod.to_html(chips_data)
@@ -1185,12 +1372,32 @@ def main() -> int:
         for line in chips_mod.to_text(chips_data):
             print(line)
 
+    # --- 族群日K 趨勢／格局：失敗只略過該區塊，不影響其他內容 ---
+    group_trends = []
+    if not csv_path and "/" in data_date:
+        try:
+            hist = update_group_history(df, data_date)
+            group_trends = compute_group_trends(df, hist, data_date.replace("/", ""))
+            if group_trends:
+                print("\n" + "=" * 60)
+                print("族群日K 趨勢／格局")
+                print("=" * 60)
+                for r in group_trends:
+                    print(
+                        f"  {r['group']}：{r['trend']}｜{r['structure']}"
+                        f"｜乖離 {r['bias']:+.1f}%｜{r['comment']}"
+                    )
+            else:
+                print("  （族群趨勢：歷史資料不足 20 日，本次略過）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  （族群趨勢判斷失敗，略過：{exc}）")
+
     label = f"　資料日期：{data_date}"
     fig = make_figure(df, label)
 
     stamp = data_date.replace("/", "") if "/" in data_date else "latest"
     out = f"twstock_group_heatmap_{stamp}.html"
-    write_html_with_summary(fig, out, data_date, summary, chips_data)
+    write_html_with_summary(fig, out, data_date, summary, chips_data, group_trends)
     print(f"\n已輸出：{out}")
     return 0
 
