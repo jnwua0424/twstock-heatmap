@@ -617,6 +617,7 @@ def classify_trend(closes: pd.Series) -> dict:
         "trend": trend,
         "structure": structure,
         "comment": TREND_COMMENTS[(trend, structure)],
+        "bias": (close / ma20 - 1) * 100,  # 收盤距月線的乖離率（%）
         "ma5": ma5,
         "ma10": ma10,
         "ma20": ma20,
@@ -983,6 +984,89 @@ def fetch_otc_index(data_date: str) -> dict:
     return {}
 
 
+def _fetch_otc_month(yyyy: int, mm: int) -> dict:
+    """抓某個月的櫃買指數日收盤，回傳 {Timestamp: 收盤}。端點與 fetch_otc_index 相同。"""
+    errors = []
+    for url, style in TPEX_INDEX_ENDPOINTS:
+        params = (
+            {"date": f"{yyyy}/{mm:02d}/01", "response": "json"}
+            if style == "new"
+            else {"l": "zh-tw", "d": f"{yyyy - 1911}/{mm:02d}", "o": "json"}
+        )
+        try:
+            r = SESSION.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+
+            fields, rows = [], []
+            if isinstance(j.get("tables"), list) and j["tables"]:
+                t = j["tables"][0]
+                fields, rows = t.get("fields") or [], t.get("data") or []
+            else:
+                fields = j.get("fields") or []
+                rows = j.get("aaData") or j.get("data") or []
+            if not rows:
+                raise RuntimeError("回應中沒有資料列")
+
+            # 與 fetch_otc_index 相同的欄位判斷：找不到欄位名稱時預設第 5 欄為櫃買指數
+            i_idx = next((i for i, f in enumerate(fields) if "指數" in str(f)), 4)
+            out = {}
+            for rw in rows:
+                try:
+                    ry, rm, rd = str(rw[0]).strip().replace(" ", "").split("/")
+                    ts = pd.Timestamp(int(ry) + 1911, int(rm), int(rd))
+                except Exception:  # noqa: BLE001
+                    continue
+                val = _to_num(pd.Series([rw[i_idx]])).iloc[0]
+                if pd.notna(val):
+                    out[ts] = float(val)
+            if out:
+                return out
+            raise RuntimeError("解析後為空")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{style} -> {exc}")
+    raise RuntimeError(f"{yyyy}/{mm:02d} 櫃買月資料抓取失敗：{'；'.join(errors)}")
+
+
+def fetch_otc_trend(data_date: str, today_close: float | None = None) -> dict:
+    """抓最近 3 個月櫃買指數日收盤，判斷日K 趨勢與格局（做法與加權指數相同）。"""
+    if "/" not in str(data_date):
+        return {}
+    y, m, d = (int(x) for x in data_date.split("/"))
+    target = pd.Timestamp(y, m, d)
+
+    records: dict = {}
+    for k in range(3):
+        yy, mm = y, m - k
+        while mm <= 0:
+            mm += 12
+            yy -= 1
+        try:
+            records.update(_fetch_otc_month(yy, mm))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  （櫃買趨勢判斷：{exc}）")
+        time.sleep(1)
+
+    closes = pd.Series(records, dtype=float).sort_index()
+    closes = closes[closes.index <= target]
+    if target not in closes.index:
+        if today_close is None or pd.isna(today_close):
+            print(f"  （櫃買趨勢判斷：月資料尚無 {data_date}，略過）")
+            return {}
+        closes.loc[target] = float(today_close)
+        closes = closes.sort_index()
+
+    info = classify_trend(closes)
+    if info:
+        print(
+            f"  櫃買日K 趨勢：{info['trend']}／{info['structure']}"
+            f"（5MA {info['ma5']:,.2f}、10MA {info['ma10']:,.2f}、20MA {info['ma20']:,.2f}）"
+        )
+    else:
+        print(f"  （櫃買趨勢判斷：資料只有 {len(closes)} 筆，不足 20 日，略過）")
+    return info
+
+
 def _accumulate_inst(out: dict, name: str, buy: float, sell: float, net: float) -> None:
     """把單位名稱歸到外資／投信／自營商三類，買進、賣出、買賣超一起累加。"""
     name = name.strip()
@@ -1107,6 +1191,7 @@ def make_summary(
     index_info: dict,
     inst_info: dict,
     trend_info: dict | None = None,
+    otc_trend_info: dict | None = None,
 ) -> list[str]:
     """用手上的資料生出一段盤勢總覽文字。"""
     lines = []
@@ -1130,12 +1215,13 @@ def make_summary(
     if parts_head:
         lines.append("；".join(parts_head) + "。")
 
-    # --- 日K 趨勢／格局（加權指數）---
-    if trend_info:
-        lines.append(
-            f"日K 趨勢：{trend_info['trend']}｜格局：{trend_info['structure']}"
-            f"｜解讀：{trend_info['comment']}。"
-        )
+    # --- 日K 趨勢／格局（加權指數、櫃買指數）---
+    for label, info in (("加權指數", trend_info), ("櫃買指數", otc_trend_info)):
+        if info:
+            lines.append(
+                f"{label}，日K 趨勢：{info['trend']}｜格局：{info['structure']}"
+                f"｜解讀：{info['comment']}｜月線乖離：{info['bias']:+.2f}%。"
+            )
 
     # --- 漲跌家數（用全市場，不只族群成分股）---
     q = all_quotes.dropna(subset=["close", "change"])
@@ -1419,7 +1505,12 @@ def main() -> int:
     trend_info = (
         fetch_taiex_trend(data_date, index_info.get("index")) if not csv_path else {}
     )
-    summary = make_summary(df, quotes, data_date, index_info, inst_info, trend_info)
+    otc_trend_info = (
+        fetch_otc_trend(data_date, index_info.get("otc_index")) if not csv_path else {}
+    )
+    summary = make_summary(
+        df, quotes, data_date, index_info, inst_info, trend_info, otc_trend_info
+    )
 
     print("\n" + "=" * 60)
     print(f"今日盤勢總覽（{data_date}）")
