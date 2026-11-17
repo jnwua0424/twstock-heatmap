@@ -1476,6 +1476,20 @@ def main() -> int:
             print("提示：可改用離線模式  python twstock_group_heatmap.py 檔案.csv")
             return 1
 
+        # STOCK_DAY_ALL（openapi 與 www 兩支）實測常常晚上還停在前一天，
+        # 但「指定日期」的 MI_INDEX 收盤後不久就有當天資料。
+        # 所以最新版不是今天時，先用今天日期直接查一次，查不到才判定為還沒更新／休市。
+        today_slash = datetime.date.today().strftime("%Y/%m/%d")
+        if data_date != today_slash:
+            print(f"  最新版只到 {data_date}，改用指定日期來源查 {today_slash}…")
+            try:
+                q2, d2 = load_quotes_by_date(stamp_today)
+                if len(q2):
+                    quotes, data_date = q2, d2
+                    print("  ✓ 指定日期來源已有今天的資料，改用它")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  （指定日期來源也還沒有：{exc}）")
+
     import datetime
 
     today = datetime.date.today().strftime("%Y/%m/%d")
