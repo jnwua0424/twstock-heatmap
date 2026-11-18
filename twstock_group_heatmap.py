@@ -1419,7 +1419,12 @@ def write_html_with_summary(
         "font-family:'Microsoft JhengHei',sans-serif;padding:20px 28px;"
         "line-height:1.9;font-size:15px;border-bottom:1px solid #333\">"
         f"<h2 style='margin:0 0 14px 0;font-size:19px;color:#fff'>"
-        f"今日盤勢總覽　<span style='font-size:14px;color:#888'>{data_date}</span></h2>"
+        f"今日盤勢總覽　<span style='font-size:14px;color:#888'>{data_date}</span>"
+        # 首頁在 docs/、歷史檔在 docs/archive/，連結路徑不同，用 JS 判斷
+        "<a id='hist-link' href='archive/' style='float:right;font-size:14px;"
+        "color:#ff5a50;text-decoration:none;font-weight:normal'>📅 所有日期</a>"
+        "<script>if(location.pathname.indexOf('/archive/')>=0)"
+        "document.getElementById('hist-link').href='./';</script></h2>"
         f"{body}</div>"
     )
 
@@ -1492,12 +1497,23 @@ def main() -> int:
 
     import datetime
 
+    import os
+
     today = datetime.date.today().strftime("%Y/%m/%d")
     print(f"\n★ 資料日期：{data_date}")
-    if not csv_path and not date_str and data_date != today:
+    # GitHub 排程常延遲好幾小時，16:00 的排程可能拖到隔天凌晨才跑。
+    # 所以不是今天的資料不代表沒用：只要那一天還沒產出過，就照樣產出（補上漏掉的那天）；
+    # 那一天已經有檔案了，才當作「還沒更新」結束。
+    if (
+        not csv_path and not date_str and data_date != today
+        and "/" in data_date
+        and os.path.exists(
+            f"docs/archive/twstock_group_heatmap_{data_date.replace('/', '')}.html"
+        )
+    ):
         print(
-            f"  注意：這不是今天（{today}）的資料，本次不輸出檔案。\n"
-            "  可能是證交所盤後資料還沒更新，或今天休市。\n"
+            f"  注意：最新資料是 {data_date}，那天的檔案已經產出過，本次不輸出檔案。\n"
+            f"  可能是證交所今天（{today}）的盤後資料還沒更新，或今天休市。\n"
             "  稍晚的排程會再試一次；也可以手動指定日期補跑。"
         )
         return EXIT_STALE
