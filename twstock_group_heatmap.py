@@ -1484,16 +1484,31 @@ def main() -> int:
         # STOCK_DAY_ALL（openapi 與 www 兩支）實測常常晚上還停在前一天，
         # 但「指定日期」的 MI_INDEX 收盤後不久就有當天資料。
         # 所以最新版不是今天時，先用今天日期直接查一次，查不到才判定為還沒更新／休市。
-        today_slash = datetime.date.today().strftime("%Y/%m/%d")
-        if data_date != today_slash:
-            print(f"  最新版只到 {data_date}，改用指定日期來源查 {today_slash}…")
-            try:
-                q2, d2 = load_quotes_by_date(stamp_today)
-                if len(q2):
-                    quotes, data_date = q2, d2
-                    print("  ✓ 指定日期來源已有今天的資料，改用它")
-            except Exception as exc:  # noqa: BLE001
-                print(f"  （指定日期來源也還沒有：{exc}）")
+        # 排程若延到隔天才跑，STOCK_DAY_ALL 甚至可能落後兩天，
+        # 所以從今天往回逐日查，直到碰到已產出過的日子或最新版的日期為止。
+        try:
+            latest = datetime.datetime.strptime(data_date, "%Y/%m/%d").date()
+        except ValueError:
+            latest = datetime.date.today() - datetime.timedelta(days=7)
+        day = datetime.date.today()
+        for _ in range(7):
+            if day <= latest:
+                break
+            d8 = day.strftime("%Y%m%d")
+            if os.path.exists(f"docs/archive/twstock_group_heatmap_{d8}.html"):
+                break  # 這天已經產出過，更舊的也不用再找
+            if day.weekday() < 5:
+                print(f"  最新版只到 {data_date}，改用指定日期來源查 {d8}…")
+                try:
+                    q2, d2 = load_quotes_by_date(d8)
+                    if len(q2):
+                        quotes, data_date = q2, d2
+                        print(f"  ✓ 指定日期來源有 {d2} 的資料，改用它")
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  （{d8} 還沒有資料：{exc}）")
+                time.sleep(2)  # 證交所對連續請求很敏感
+            day -= datetime.timedelta(days=1)
 
     import datetime
 
